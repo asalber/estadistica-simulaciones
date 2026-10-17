@@ -3,6 +3,7 @@
 # - Aproximación de la distribución binomial mediante la Poisson
 # - Teorema central del límite
 # - Intervalos de confianza para la media y para proporciones
+# - Contrastes de hipótesis para la comparación de dos medias o dos proporciones
 
 library(shiny)
 library(bslib)
@@ -50,6 +51,7 @@ tema <- function(m) {
 }
 
 fmt <- function(x, d = 4) formatC(x, digits = d, format = "f", decimal.mark = ",")
+pct <- function(x, d = 1) paste0(fmt(100 * x, d), " %")
 
 # Distribuciones de población para el teorema central del límite --------------
 
@@ -121,6 +123,161 @@ poblacion <- function(input) {
   )
 }
 
+# Contrastes de comparación de dos poblaciones ---------------------------------
+
+# Los parámetros de un contraste son una lista con el tipo ("media" o
+# "proporcion"), los tamaños muestrales n1 y n2, el nivel de significación alfa,
+# la hipótesis alternativa alt ("bilateral", "mayor" o "menor") y los parámetros
+# de cada población: mu1, mu2, sd1, sd2 y var ("welch" o "iguales") en las
+# medias, o p1 y p2 en las proporciones.
+
+# Bajo la hipótesis nula la segunda población tiene la misma media (o
+# proporción) que la primera; el resto de parámetros no cambia.
+bajo_h0 <- function(s) {
+  if (s$tipo == "media") s$mu2 <- s$mu1 else s$p2 <- s$p1
+  s
+}
+
+diferencia <- function(s) if (s$tipo == "media") s$mu1 - s$mu2 else s$p1 - s$p2
+
+# Grados de libertad de Welch-Satterthwaite a partir de las varianzas v1 y v2.
+gl_welch <- function(v1, v2, n1, n2) {
+  a <- v1 / n1
+  b <- v2 / n2
+  (a + b)^2 / (a^2 / (n1 - 1) + b^2 / (n2 - 1))
+}
+
+# Rechazo de H0 según la hipótesis alternativa, con q la función cuantil de la
+# distribución del estadístico bajo H0.
+rechazo <- function(t, alt, alfa, q) {
+  switch(alt,
+    bilateral = abs(t) > q(1 - alfa / 2),
+    mayor = t > q(1 - alfa),
+    menor = t < q(alfa)
+  )
+}
+
+# Simula k contrastes y devuelve el estadístico y la decisión de cada uno. En
+# las medias de poblaciones normales se simulan directamente la media y la
+# cuasivarianza de cada muestra (x̄ ~ N(μ, σ/√n) y (n − 1)s²/σ² ~ χ²(n − 1),
+# independientes), lo que equivale a generar las muestras y es mucho más rápido.
+contraste <- function(s, k) {
+  n1 <- s$n1
+  n2 <- s$n2
+  if (s$tipo == "media") {
+    m1 <- rnorm(k, s$mu1, s$sd1 / sqrt(n1))
+    m2 <- rnorm(k, s$mu2, s$sd2 / sqrt(n2))
+    v1 <- s$sd1^2 * rchisq(k, n1 - 1) / (n1 - 1)
+    v2 <- s$sd2^2 * rchisq(k, n2 - 1) / (n2 - 1)
+    if (s$var == "iguales") {
+      gl <- n1 + n2 - 2
+      se <- sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / gl * (1 / n1 + 1 / n2))
+    } else {
+      gl <- gl_welch(v1, v2, n1, n2)
+      se <- sqrt(v1 / n1 + v2 / n2)
+    }
+    t <- (m1 - m2) / se
+    q <- function(p) qt(p, gl)
+  } else {
+    x1 <- rbinom(k, n1, s$p1)
+    x2 <- rbinom(k, n2, s$p2)
+    p <- (x1 + x2) / (n1 + n2)
+    se <- sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
+    # Si todas las observaciones son éxitos (o fracasos) no hay diferencia.
+    t <- ifelse(se > 0, (x1 / n1 - x2 / n2) / se, 0)
+    q <- qnorm
+  }
+  list(t = t, rechaza = rechazo(t, s$alt, s$alfa, q))
+}
+
+# Valores críticos del estadístico. En el contraste de Welch los grados de
+# libertad dependen de cada muestra; se usan los de las varianzas poblacionales.
+criticos <- function(s) {
+  q <- if (s$tipo == "proporcion") {
+    qnorm
+  } else if (s$var == "iguales") {
+    function(p) qt(p, s$n1 + s$n2 - 2)
+  } else {
+    function(p) qt(p, gl_welch(s$sd1^2, s$sd2^2, s$n1, s$n2))
+  }
+  switch(s$alt,
+    bilateral = c(-1, 1) * q(1 - s$alfa / 2),
+    mayor = q(1 - s$alfa),
+    menor = q(s$alfa)
+  )
+}
+
+# Distribución teórica del estadístico de contraste: lista con la densidad d,
+# la función de distribución p y la función cuantil q.
+# - Medias: el estadístico es (aproximadamente) escala · t no central con gl
+#   grados de libertad y parámetro de no centralidad (μ₁ − μ₂)/√(σ₁²/n₁ + σ₂²/n₂).
+#   Con la t de Student y σ₁ = σ₂ es exacta (escala = 1, gl = n₁ + n₂ − 2). Con
+#   σ₁ ≠ σ₂ la varianza ponderada no estima el error típico real, lo que da la
+#   escala, y sus grados de libertad se aproximan por Satterthwaite. En la t de
+#   Welch se usan los grados de libertad de Welch-Satterthwaite.
+# - Proporciones: aproximación normal de la diferencia de proporciones
+#   muestrales, con el error típico ponderado se0 en el denominador del
+#   estadístico y el error típico real se1.
+distribucion <- function(s) {
+  if (s$tipo == "media") {
+    se <- sqrt(s$sd1^2 / s$n1 + s$sd2^2 / s$n2)
+    ncp <- diferencia(s) / se
+    if (s$var == "iguales") {
+      a <- (s$n1 - 1) * s$sd1^2
+      b <- (s$n2 - 1) * s$sd2^2
+      gl <- (a + b)^2 / ((s$n1 - 1) * s$sd1^4 + (s$n2 - 1) * s$sd2^4)
+      escala <- se / sqrt((a + b) / (s$n1 + s$n2 - 2) * (1 / s$n1 + 1 / s$n2))
+    } else {
+      gl <- gl_welch(s$sd1^2, s$sd2^2, s$n1, s$n2)
+      escala <- 1
+    }
+    # La t no central avisa de pérdidas de precisión irrelevantes aquí.
+    list(
+      d = function(x) suppressWarnings(dt(x / escala, gl, ncp)) / escala,
+      p = function(x) suppressWarnings(pt(x / escala, gl, ncp)),
+      q = function(p) suppressWarnings(qt(p, gl, ncp)) * escala
+    )
+  } else {
+    p <- (s$n1 * s$p1 + s$n2 * s$p2) / (s$n1 + s$n2)
+    se0 <- sqrt(p * (1 - p) * (1 / s$n1 + 1 / s$n2))
+    se1 <- sqrt(s$p1 * (1 - s$p1) / s$n1 + s$p2 * (1 - s$p2) / s$n2)
+    media <- diferencia(s) / se0
+    sd <- se1 / se0
+    list(
+      d = function(x) dnorm(x, media, sd),
+      p = function(x) pnorm(x, media, sd),
+      q = function(p) qnorm(p, media, sd)
+    )
+  }
+}
+
+# Probabilidad teórica de rechazar H0 con los parámetros dados: error de tipo I
+# si H0 es cierta y potencia si no lo es.
+prob_rechazo <- function(s) {
+  f <- distribucion(s)$p
+  crit <- criticos(s)
+  switch(s$alt,
+    bilateral = f(crit[1]) + 1 - f(crit[2]),
+    mayor = 1 - f(crit),
+    menor = f(crit)
+  )
+}
+
+# Tamaño del efecto: d de Cohen con la desviación típica combinada
+# √((σ₁² + σ₂²)/2) para las medias y h de Cohen para las proporciones.
+tamano_efecto <- function(s) {
+  if (s$tipo == "media") {
+    diferencia(s) / sqrt((s$sd1^2 + s$sd2^2) / 2)
+  } else {
+    2 * asin(sqrt(s$p1)) - 2 * asin(sqrt(s$p2))
+  }
+}
+
+magnitud_efecto <- function(e) {
+  e <- abs(e)
+  if (e < 0.2) "Insignificante" else if (e < 0.5) "Pequeño" else if (e < 0.8) "Mediano" else "Grande"
+}
+
 # Interfaz ---------------------------------------------------------------------
 
 boton_simular <- function(id) {
@@ -141,19 +298,27 @@ fila_valores <- function(...) {
   )
 }
 
-# Recuadros de valores más compactos en pantallas pequeñas (< 576 px). En
-# móvil bslib fuerza todas las rejillas a una columna; en las filas de valores
-# se restablecen las 12 columnas para que los recuadros vayan de dos en dos.
-# Los selectores llevan la clase .fila-valores para ganar en especificidad al
-# CSS de bslib, que se carga después.
+# Recuadros de valores más compactos que los de bslib, y aún más en pantallas
+# pequeñas (< 576 px). En móvil bslib fuerza todas las rejillas a una columna;
+# en las filas de valores se restablecen las 12 columnas para que los
+# recuadros vayan de dos en dos. Los selectores llevan la clase .fila-valores
+# para ganar en especificidad al CSS de bslib, que se carga después.
 estilo_movil <- "
+.fila-valores .bslib-value-box > .card-body { padding: 0; }
+.fila-valores .bslib-value-box .value-box-area { padding: 0.75rem 1rem; }
+.fila-valores .bslib-value-box .value-box-title {
+  font-size: 0.9rem; margin-bottom: 0.25rem;
+}
+.fila-valores .bslib-value-box .value-box-value {
+  font-size: 1.5rem; margin-bottom: 0.15rem;
+}
+.fila-valores .bslib-value-box .value-box-area p { font-size: 0.8rem; }
 @media (max-width: 575.98px) {
   .bslib-grid.fila-valores {
     grid-template-columns: repeat(12, minmax(0, 1fr)) !important;
     gap: 0.5rem;
   }
   .fila-valores .bslib-value-box { margin-bottom: 0; }
-  .fila-valores .bslib-value-box > .card-body { padding: 0; }
   .fila-valores .bslib-value-box .value-box-area { padding: 0.5rem 0.75rem; }
   .fila-valores .bslib-value-box .value-box-title {
     font-size: 0.75rem; line-height: 1.2; margin-bottom: 0.25rem;
@@ -197,7 +362,7 @@ ui_lgn <- nav_panel(
 )
 
 ui_bp <- nav_panel(
-  "Aproximación binomial → Poisson",
+  "Ley de los casos raros",
   layout_sidebar(
     sidebar = sidebar(
       width = 300,
@@ -345,6 +510,92 @@ ui_ic <- nav_panel(
   )
 )
 
+ui_ct <- nav_panel(
+  "Contrastes de hipótesis",
+  layout_sidebar(
+    sidebar = sidebar(
+      width = 300,
+      title = "Parámetros",
+      radioButtons("ct_tipo", "Comparación",
+        choices = c(
+          "Medias de dos poblaciones normales" = "media",
+          "Proporciones de dos poblaciones" = "proporcion"
+        )
+      ),
+      conditionalPanel(
+        "input.ct_tipo == 'media'",
+        numericInput("ct_mu1", "Media de la población 1 (μ₁)", value = 100),
+        numericInput("ct_mu2", "Media de la población 2 (μ₂)", value = 105),
+        sliderInput("ct_sd1", "Desviación típica de la población 1 (σ₁)", min = 1, max = 50, value = 15, step = 0.5),
+        sliderInput("ct_sd2", "Desviación típica de la población 2 (σ₂)", min = 1, max = 50, value = 15, step = 0.5),
+        radioButtons("ct_var", "Varianzas poblacionales (desconocidas)",
+          choices = c(
+            "Distintas (t de Welch)" = "welch",
+            "Iguales (t de Student con varianza ponderada)" = "iguales"
+          )
+        )
+      ),
+      conditionalPanel(
+        "input.ct_tipo == 'proporcion'",
+        sliderInput("ct_p1", "Proporción de la población 1 (p₁)", min = 0.01, max = 0.99, value = 0.3, step = 0.01),
+        sliderInput("ct_p2", "Proporción de la población 2 (p₂)", min = 0.01, max = 0.99, value = 0.4, step = 0.01)
+      ),
+      sliderInput("ct_n1", "Tamaño de la muestra 1 (n₁)", min = 2, max = 500, value = 30, step = 1),
+      sliderInput("ct_n2", "Tamaño de la muestra 2 (n₂)", min = 2, max = 500, value = 30, step = 1),
+      selectInput("ct_alt", "Hipótesis alternativa (H₁)",
+        choices = c(
+          "Bilateral: población 1 ≠ población 2" = "bilateral",
+          "Unilateral: población 1 > población 2" = "mayor",
+          "Unilateral: población 1 < población 2" = "menor"
+        )
+      ),
+      sliderInput("ct_alfa", "Nivel de significación (α)", min = 0.01, max = 0.20, value = 0.05, step = 0.01),
+      sliderInput("ct_k", "Número de contrastes simulados", min = 100, max = 10000, value = 2000, step = 100),
+      radioButtons("ct_distr", "Distribución del estadístico",
+        choices = c("Simulada (histograma)" = "sim", "Teórica (curva)" = "teo", "Ambas" = "ambas")
+      ),
+      radioButtons("ct_eje", "En el gráfico de errores, variar",
+        choices = c("El tamaño muestral" = "n", "La variabilidad de las poblaciones" = "var")
+      ),
+      checkboxInput("ct_teorica", "Superponer los valores teóricos", value = TRUE),
+      boton_simular("ct_sim"),
+      helpText(
+        "Para estimar el error de tipo I se simulan contrastes con H₀ cierta",
+        "(μ₂ = μ₁ o p₂ = p₁, manteniendo el resto de parámetros); para el error",
+        "de tipo II y la potencia, con los parámetros elegidos."
+      ),
+      helpText(
+        "Las distribuciones teóricas son exactas para la t de Student con σ₁ = σ₂.",
+        "En los demás casos son aproximaciones: t no central con grados de",
+        "libertad de Satterthwaite para las medias y normal para las proporciones."
+      )
+    ),
+    fila_valores(
+      value_box(
+        textOutput("ct_efecto_titulo"), textOutput("ct_efecto"),
+        p(textOutput("ct_efecto_magnitud", inline = TRUE)),
+        theme = "primary"
+      ),
+      value_box("Error de tipo I simulado", textOutput("ct_tipo1"), p(textOutput("ct_tipo1_teo", inline = TRUE))),
+      value_box("Error de tipo II simulado (β)", textOutput("ct_tipo2"), p(textOutput("ct_tipo2_teo", inline = TRUE))),
+      value_box("Potencia simulada (1 − β)", textOutput("ct_potencia"), p(textOutput("ct_potencia_teo", inline = TRUE)))
+    ),
+    layout_columns(
+      col_widths = c(6, 6),
+      card(
+        full_screen = TRUE,
+        card_header("Distribución del estadístico de contraste bajo H₀ y bajo H₁"),
+        plotOutput("ct_plot", height = "450px")
+      ),
+      card(
+        full_screen = TRUE,
+        card_header(textOutput("ct_curva_titulo", inline = TRUE)),
+        plotOutput("ct_curva_plot", height = "450px")
+      )
+    )
+  )
+)
+
 ui <- page_navbar(
   title = tags$span(
     class = "d-inline-flex align-items-center gap-2",
@@ -357,6 +608,7 @@ ui <- page_navbar(
   ui_bp,
   ui_tcl,
   ui_ic,
+  ui_ct,
   nav_spacer(),
   nav_item(input_dark_mode(id = "modo", mode = "light"))
 )
@@ -633,6 +885,210 @@ server <- function(input, output, session) {
         subtitle = "Línea discontinua: nivel de confianza"
       ) +
       tema(m)
+  })
+
+  # Contrastes de hipótesis ----------------------------------------------------
+
+  ct_par <- reactive({
+    s <- list(
+      tipo = input$ct_tipo, n1 = input$ct_n1, n2 = input$ct_n2,
+      alfa = input$ct_alfa, alt = input$ct_alt
+    )
+    if (s$tipo == "media") {
+      req(is.finite(input$ct_mu1), is.finite(input$ct_mu2))
+      c(s, list(
+        mu1 = input$ct_mu1, mu2 = input$ct_mu2,
+        sd1 = input$ct_sd1, sd2 = input$ct_sd2, var = input$ct_var
+      ))
+    } else {
+      c(s, list(p1 = input$ct_p1, p2 = input$ct_p2))
+    }
+  })
+
+  ct <- reactive({
+    input$ct_sim
+    s <- ct_par()
+    list(
+      s = s, d = diferencia(s),
+      h0 = contraste(bajo_h0(s), input$ct_k),
+      h1 = contraste(s, input$ct_k)
+    )
+  })
+
+  ct_teo <- reactive({
+    s <- ct_par()
+    list(tipo1 = prob_rechazo(bajo_h0(s)), potencia = prob_rechazo(s))
+  })
+
+  output$ct_efecto_titulo <- renderText(
+    if (ct_par()$tipo == "media") "Tamaño del efecto (d de Cohen)" else "Tamaño del efecto (h de Cohen)"
+  )
+  output$ct_efecto <- renderText(fmt(tamano_efecto(ct_par()), 2))
+  output$ct_efecto_magnitud <- renderText(paste("Efecto", tolower(magnitud_efecto(tamano_efecto(ct_par())))))
+  output$ct_tipo1 <- renderText(pct(mean(ct()$h0$rechaza)))
+  output$ct_tipo1_teo <- renderText(
+    paste0("α = ", pct(ct_par()$alfa, 0), " · Teórico: ", pct(ct_teo()$tipo1))
+  )
+  output$ct_tipo2 <- renderText(if (ct()$d == 0) "—" else pct(mean(!ct()$h1$rechaza)))
+  output$ct_potencia <- renderText(if (ct()$d == 0) "—" else pct(mean(ct()$h1$rechaza)))
+  output$ct_tipo2_teo <- renderText(
+    if (diferencia(ct_par()) == 0) "H₁ no es cierta" else paste("Teórico:", pct(1 - ct_teo()$potencia))
+  )
+  output$ct_potencia_teo <- renderText(
+    if (diferencia(ct_par()) == 0) "H₁ no es cierta" else paste("Teórica:", pct(ct_teo()$potencia))
+  )
+
+  output$ct_plot <- renderPlot({
+    s <- ct_par()
+    m <- m()
+    modo <- input$ct_distr
+    simbolo <- if (s$tipo == "media") "μ" else "p"
+    niveles <- c(
+      sprintf("Bajo H₀ (%s₁ = %s₂)", simbolo, simbolo),
+      sprintf("Bajo H₁ (%s₁ − %s₂ = %s)", simbolo, simbolo, fmt(diferencia(s), 2))
+    )
+    colores <- setNames(m$series[1:2], niveles)
+    crit <- criticos(s)
+    teoricas <- list(distribucion(bajo_h0(s)), distribucion(s))
+    # Se recortan las colas extremas (con muestras pequeñas el estadístico t
+    # tiene colas muy pesadas); las densidades simuladas se calculan sobre el
+    # total de contrastes.
+    if (modo == "sim") {
+      r <- ct()
+      lim <- range(quantile(c(r$h0$t, r$h1$t), c(0.002, 0.998)), crit)
+    } else {
+      lim <- range(sapply(teoricas, function(f) f$q(c(0.002, 0.998))), crit)
+    }
+    zona <- switch(s$alt,
+      bilateral = data.frame(xmin = c(-Inf, crit[2]), xmax = c(crit[1], Inf)),
+      mayor = data.frame(xmin = crit, xmax = Inf),
+      menor = data.frame(xmin = -Inf, xmax = crit)
+    )
+    g <- ggplot() +
+      geom_rect(
+        data = zona, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+        fill = m$series[8], alpha = 0.12
+      )
+    if (modo != "teo") {
+      r <- ct()
+      k <- length(r$h0$t)
+      d <- data.frame(t = c(r$h0$t, r$h1$t), hip = factor(rep(niveles, each = k), levels = niveles))
+      d <- d[d$t >= lim[1] & d$t <= lim[2], ]
+      g <- g + geom_histogram(
+        data = d, aes(t, y = after_stat(count / (k * width)), fill = hip),
+        binwidth = diff(lim) / 60, boundary = 0, position = "identity",
+        alpha = if (modo == "sim") 0.55 else 0.35
+      )
+    }
+    if (modo != "sim") {
+      x <- seq(lim[1], lim[2], length.out = 500)
+      curvas <- data.frame(
+        t = c(x, x), densidad = c(teoricas[[1]]$d(x), teoricas[[2]]$d(x)),
+        hip = factor(rep(niveles, each = length(x)), levels = niveles)
+      )
+      if (modo == "teo") {
+        g <- g + geom_area(
+          data = curvas, aes(t, densidad, fill = hip),
+          position = "identity", alpha = 0.3
+        )
+      }
+      g <- g + geom_line(data = curvas, aes(t, densidad, colour = hip), linewidth = 1)
+    }
+    g +
+      geom_vline(xintercept = crit, linetype = "dashed", colour = m$secundario, linewidth = 0.6) +
+      scale_fill_manual(values = colores, name = NULL, aesthetics = c("fill", "colour")) +
+      coord_cartesian(xlim = lim) +
+      labs(
+        x = "Estadístico de contraste", y = "Densidad",
+        subtitle = paste0(
+          "Zona sombreada: región de rechazo de H₀ (α = ", pct(s$alfa, 0), ").\n",
+          "Área de H₀ en ella: error de tipo I; área de H₁: potencia."
+        )
+      ) +
+      tema(m)
+  })
+
+  # Errores y potencia al variar el tamaño muestral o la variabilidad, con el
+  # resto de parámetros fijos.
+  ct_curva <- reactive({
+    input$ct_sim
+    s <- ct_par()
+    k <- min(input$ct_k, 2000)
+    if (input$ct_eje == "n") {
+      x <- unique(round(exp(seq(log(2), log(500), length.out = 30))))
+      r <- s$n2 / s$n1
+      casos <- lapply(x, function(v) modifyList(s, list(n1 = v, n2 = max(2, round(r * v)))))
+      etiqueta <- "Tamaño de la muestra 1 (n₁), con n₂/n₁ fijo"
+      actual <- s$n1
+    } else if (s$tipo == "media") {
+      f <- seq(0.1, 3, length.out = 30)
+      x <- f * s$sd1
+      casos <- lapply(f, function(v) modifyList(s, list(sd1 = v * s$sd1, sd2 = v * s$sd2)))
+      etiqueta <- "Desviación típica de la población 1 (σ₁), con σ₂/σ₁ fijo"
+      actual <- s$sd1
+    } else {
+      # Se desplazan ambas proporciones manteniendo su diferencia: la varianza
+      # p(1 − p) es máxima en p = 0,5 y disminuye hacia los extremos.
+      dif <- s$p2 - s$p1
+      x <- seq(max(0.01, 0.01 - dif), min(0.99, 0.99 - dif), length.out = 30)
+      casos <- lapply(x, function(v) modifyList(s, list(p1 = v, p2 = min(max(v + dif, 0.01), 0.99))))
+      etiqueta <- "Proporción de la población 1 (p₁), con p₂ − p₁ fija"
+      actual <- s$p1
+    }
+    datos <- data.frame(
+      x = x,
+      tipo1 = vapply(casos, function(v) mean(contraste(bajo_h0(v), k)$rechaza), numeric(1)),
+      potencia = vapply(casos, function(v) mean(contraste(v, k)$rechaza), numeric(1)),
+      tipo1_teo = vapply(casos, function(v) prob_rechazo(bajo_h0(v)), numeric(1)),
+      potencia_teo = vapply(casos, prob_rechazo, numeric(1))
+    )
+    list(datos = datos, etiqueta = etiqueta, actual = actual, s = s, log = input$ct_eje == "n")
+  })
+
+  output$ct_curva_titulo <- renderText(
+    if (input$ct_eje == "n") {
+      "Errores y potencia según el tamaño muestral"
+    } else {
+      "Errores y potencia según la variabilidad de las poblaciones"
+    }
+  )
+
+  output$ct_curva_plot <- renderPlot({
+    cv <- ct_curva()
+    m <- m()
+    series <- c("Error de tipo I", "Error de tipo II (β)", "Potencia (1 − β)")
+    fuentes <- c("Simulado", "Teórico")
+    d <- with(cv$datos, rbind(
+      data.frame(x = x, valor = tipo1, serie = series[1], fuente = fuentes[1]),
+      data.frame(x = x, valor = 1 - potencia, serie = series[2], fuente = fuentes[1]),
+      data.frame(x = x, valor = potencia, serie = series[3], fuente = fuentes[1]),
+      data.frame(x = x, valor = tipo1_teo, serie = series[1], fuente = fuentes[2]),
+      data.frame(x = x, valor = 1 - potencia_teo, serie = series[2], fuente = fuentes[2]),
+      data.frame(x = x, valor = potencia_teo, serie = series[3], fuente = fuentes[2])
+    ))
+    if (diferencia(cv$s) == 0) d <- d[d$serie == series[1], ]
+    if (!input$ct_teorica) d <- d[d$fuente == fuentes[1], ]
+    d$serie <- factor(d$serie, levels = series)
+    d$fuente <- factor(d$fuente, levels = fuentes)
+    g <- ggplot(d, aes(x, valor, colour = serie)) +
+      geom_hline(yintercept = cv$s$alfa, linetype = "dashed", colour = m$secundario, linewidth = 0.6) +
+      geom_vline(xintercept = cv$actual, linetype = "dotted", colour = m$secundario, linewidth = 0.6) +
+      geom_line(aes(linetype = fuente, linewidth = fuente)) +
+      geom_point(data = d[d$fuente == fuentes[1], ], size = 1.5) +
+      scale_colour_manual(values = setNames(m$series[c(1, 3, 2)], series), name = NULL) +
+      scale_linetype_manual(values = setNames(c("solid", "22"), fuentes), name = NULL) +
+      scale_linewidth_manual(values = setNames(c(0.8, 0.6), fuentes), name = NULL) +
+      scale_y_continuous(limits = c(0, 1), labels = function(x) pct(x, 0)) +
+      labs(
+        x = cv$etiqueta, y = "Probabilidad",
+        subtitle = "Línea discontinua: α. Línea de puntos: valor actual."
+      ) +
+      guides(colour = guide_legend(order = 1)) +
+      tema(m) +
+      theme(legend.box = "vertical", legend.spacing.y = unit(0, "pt"))
+    if (!input$ct_teorica) g <- g + guides(linetype = "none", linewidth = "none")
+    if (cv$log) g <- g + scale_x_log10()
+    g
   })
 }
 
