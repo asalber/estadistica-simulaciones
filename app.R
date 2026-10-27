@@ -4,6 +4,7 @@
 # - Teorema central del límite
 # - Intervalos de confianza para la media y para proporciones
 # - Contrastes de hipótesis para la comparación de dos medias o dos proporciones
+# - Comparación de dos poblaciones normales, binomiales o de Poisson
 
 library(shiny)
 library(bslib)
@@ -125,20 +126,34 @@ poblacion <- function(input) {
 
 # Contrastes de comparación de dos poblaciones ---------------------------------
 
-# Los parámetros de un contraste son una lista con el tipo ("media" o
-# "proporcion"), los tamaños muestrales n1 y n2, el nivel de significación alfa,
-# la hipótesis alternativa alt ("bilateral", "mayor" o "menor") y los parámetros
-# de cada población: mu1, mu2, sd1, sd2 y var ("welch" o "iguales") en las
-# medias, o p1 y p2 en las proporciones.
+# Los parámetros de un contraste son una lista con el tipo ("media",
+# "proporcion" o "poisson"), los tamaños muestrales n1 y n2, el nivel de
+# significación alfa, la hipótesis alternativa alt ("bilateral", "mayor" o
+# "menor") y los parámetros de cada población: mu1, mu2, sd1, sd2 y var
+# ("welch" o "iguales") en las medias de poblaciones normales, p1 y p2 en las
+# proporciones (n1 y n2 son entonces el número de ensayos) o l1 y l2 en las
+# medias de poblaciones de Poisson.
+parametros <- list(media = c("mu1", "mu2"), proporcion = c("p1", "p2"), poisson = c("l1", "l2"))
 
-# Bajo la hipótesis nula la segunda población tiene la misma media (o
-# proporción) que la primera; el resto de parámetros no cambia.
-bajo_h0 <- function(s) {
-  if (s$tipo == "media") s$mu2 <- s$mu1 else s$p2 <- s$p1
+diferencia <- function(s) {
+  k <- parametros[[s$tipo]]
+  s[[k[1]]] - s[[k[2]]]
+}
+
+# Parámetros con θ₁ − θ₂ = d, cambiando el de la segunda población.
+con_diferencia <- function(s, d) {
+  k <- parametros[[s$tipo]]
+  s[[k[2]]] <- s[[k[1]]] - d
   s
 }
 
-diferencia <- function(s) if (s$tipo == "media") s$mu1 - s$mu2 else s$p1 - s$p2
+# Bajo la hipótesis nula la segunda población tiene la misma media (o
+# proporción) que la primera; el resto de parámetros no cambia.
+bajo_h0 <- function(s) con_diferencia(s, 0)
+
+# Varianza de una observación en función del parámetro en las poblaciones
+# binomiales (ensayos de Bernoulli) y de Poisson.
+varianza <- function(s, theta) if (s$tipo == "proporcion") theta * (1 - theta) else theta
 
 # Grados de libertad de Welch-Satterthwaite a partir de las varianzas v1 y v2.
 gl_welch <- function(v1, v2, n1, n2) {
@@ -179,11 +194,19 @@ contraste <- function(s, k) {
     t <- (m1 - m2) / se
     q <- function(p) qt(p, gl)
   } else {
-    x1 <- rbinom(k, n1, s$p1)
-    x2 <- rbinom(k, n2, s$p2)
-    p <- (x1 + x2) / (n1 + n2)
-    se <- sqrt(p * (1 - p) * (1 / n1 + 1 / n2))
-    # Si todas las observaciones son éxitos (o fracasos) no hay diferencia.
+    # Totales de cada muestra: número de éxitos en las proporciones y suma de
+    # las observaciones en las de Poisson. El estadístico usa la estimación
+    # conjunta del parámetro bajo H0.
+    if (s$tipo == "proporcion") {
+      x1 <- rbinom(k, n1, s$p1)
+      x2 <- rbinom(k, n2, s$p2)
+    } else {
+      x1 <- rpois(k, n1 * s$l1)
+      x2 <- rpois(k, n2 * s$l2)
+    }
+    se <- sqrt(varianza(s, (x1 + x2) / (n1 + n2)) * (1 / n1 + 1 / n2))
+    # Si todas las observaciones son iguales (todo éxitos o fracasos, o todo
+    # ceros) no hay diferencia.
     t <- ifelse(se > 0, (x1 / n1 - x2 / n2) / se, 0)
     q <- qnorm
   }
@@ -193,7 +216,7 @@ contraste <- function(s, k) {
 # Valores críticos del estadístico. En el contraste de Welch los grados de
 # libertad dependen de cada muestra; se usan los de las varianzas poblacionales.
 criticos <- function(s) {
-  q <- if (s$tipo == "proporcion") {
+  q <- if (s$tipo != "media") {
     qnorm
   } else if (s$var == "iguales") {
     function(p) qt(p, s$n1 + s$n2 - 2)
@@ -215,9 +238,9 @@ criticos <- function(s) {
 #   σ₁ ≠ σ₂ la varianza ponderada no estima el error típico real, lo que da la
 #   escala, y sus grados de libertad se aproximan por Satterthwaite. En la t de
 #   Welch se usan los grados de libertad de Welch-Satterthwaite.
-# - Proporciones: aproximación normal de la diferencia de proporciones
-#   muestrales, con el error típico ponderado se0 en el denominador del
-#   estadístico y el error típico real se1.
+# - Proporciones y Poisson: aproximación normal de la diferencia de
+#   proporciones (o medias) muestrales, con el error típico ponderado se0 en el
+#   denominador del estadístico y el error típico real se1.
 distribucion <- function(s) {
   if (s$tipo == "media") {
     se <- sqrt(s$sd1^2 / s$n1 + s$sd2^2 / s$n2)
@@ -238,9 +261,12 @@ distribucion <- function(s) {
       q = function(p) suppressWarnings(qt(p, gl, ncp)) * escala
     )
   } else {
-    p <- (s$n1 * s$p1 + s$n2 * s$p2) / (s$n1 + s$n2)
-    se0 <- sqrt(p * (1 - p) * (1 / s$n1 + 1 / s$n2))
-    se1 <- sqrt(s$p1 * (1 - s$p1) / s$n1 + s$p2 * (1 - s$p2) / s$n2)
+    k <- parametros[[s$tipo]]
+    t1 <- s[[k[1]]]
+    t2 <- s[[k[2]]]
+    conjunto <- (s$n1 * t1 + s$n2 * t2) / (s$n1 + s$n2)
+    se0 <- sqrt(varianza(s, conjunto) * (1 / s$n1 + 1 / s$n2))
+    se1 <- sqrt(varianza(s, t1) / s$n1 + varianza(s, t2) / s$n2)
     media <- diferencia(s) / se0
     sd <- se1 / se0
     list(
@@ -280,8 +306,8 @@ magnitud_efecto <- function(e) {
 
 # Interfaz ---------------------------------------------------------------------
 
-boton_simular <- function(id) {
-  actionButton(id, "Simular de nuevo", icon = icon("dice"), class = "btn-primary")
+boton_simular <- function(id, etiqueta = "Simular de nuevo") {
+  actionButton(id, etiqueta, icon = icon("dice"), class = "btn-primary")
 }
 
 # Fila de recuadros de valores: en pantallas pequeñas van de dos en dos (el
@@ -596,6 +622,91 @@ ui_ct <- nav_panel(
   )
 )
 
+ui_cd <- nav_panel(
+  "Comparación de dos poblaciones",
+  layout_sidebar(
+    sidebar = sidebar(
+      width = 300,
+      title = "Parámetros",
+      selectInput("cd_dist", "Distribución de las poblaciones",
+        choices = c("Normal" = "normal", "Binomial" = "binomial", "Poisson" = "poisson")
+      ),
+      conditionalPanel(
+        "input.cd_dist == 'normal'",
+        numericInput("cd_mu1", "Media de la población 1 (μ₁)", value = 100),
+        numericInput("cd_sd1", "Desviación típica de la población 1 (σ₁)", value = 15, min = 0.01),
+        numericInput("cd_mu2", "Media de la población 2 (μ₂)", value = 105),
+        numericInput("cd_sd2", "Desviación típica de la población 2 (σ₂)", value = 15, min = 0.01),
+        radioButtons("cd_var", "Varianzas poblacionales (desconocidas)",
+          choices = c(
+            "Distintas (t de Welch)" = "welch",
+            "Iguales (t de Student con varianza ponderada)" = "iguales"
+          )
+        ),
+        numericInput("cd_delta_norm", "Diferencia mínima a detectar (δ = |μ₁ − μ₂|)", value = 5, min = 0)
+      ),
+      conditionalPanel(
+        "input.cd_dist == 'binomial'",
+        sliderInput("cd_m", "Número de ensayos de cada observación (m)", min = 1, max = 50, value = 1, step = 1),
+        sliderInput("cd_p1", "Probabilidad de éxito en la población 1 (p₁)", min = 0.01, max = 0.99, value = 0.3, step = 0.01),
+        sliderInput("cd_p2", "Probabilidad de éxito en la población 2 (p₂)", min = 0.01, max = 0.99, value = 0.4, step = 0.01),
+        sliderInput("cd_delta_binom", "Diferencia mínima a detectar (δ = |p₁ − p₂|)",
+          min = 0.01, max = 0.5, value = 0.1, step = 0.01
+        )
+      ),
+      conditionalPanel(
+        "input.cd_dist == 'poisson'",
+        sliderInput("cd_l1", "Media de la población 1 (λ₁)", min = 0.1, max = 20, value = 4, step = 0.1),
+        sliderInput("cd_l2", "Media de la población 2 (λ₂)", min = 0.1, max = 20, value = 5, step = 0.1),
+        sliderInput("cd_delta_pois", "Diferencia mínima a detectar (δ = |λ₁ − λ₂|)",
+          min = 0.1, max = 10, value = 1, step = 0.1
+        )
+      ),
+      # El rango de los tamaños muestrales depende de la distribución (ver
+      # rangos_n en el servidor); estos son los de la normal.
+      sliderInput("cd_n1", "Tamaño de la muestra 1 (n₁)", min = 5, max = 100, value = 50, step = 1),
+      sliderInput("cd_n2", "Tamaño de la muestra 2 (n₂)", min = 5, max = 100, value = 50, step = 1),
+      selectInput("cd_alt", "Hipótesis alternativa (H₁)",
+        choices = c(
+          "Bilateral: población 1 ≠ población 2" = "bilateral",
+          "Unilateral: población 1 > población 2" = "mayor",
+          "Unilateral: población 1 < población 2" = "menor"
+        )
+      ),
+      sliderInput("cd_alfa", "Nivel de significación (α)", min = 0.01, max = 0.20, value = 0.05, step = 0.01),
+      sliderInput("cd_k", "Número de simulaciones", min = 1, max = 10000, value = 1000, step = 1),
+      checkboxInput("cd_eje_fijo", "Fijar la escala del eje X en el rango actual", value = FALSE),
+      boton_simular("cd_sim", "Simular"),
+      helpText(
+        "En cada simulación se extrae una muestra de cada población y se realiza",
+        "el contraste. La simulación se borra al cambiar cualquier parámetro y hay",
+        "que volver a pulsar «Simular». Las distribuciones teóricas se calculan bajo H₀ (con el",
+        "parámetro de la población 2 igual al de la 1) y bajo H₁ con la diferencia",
+        "mínima δ en el sentido de la alternativa (en la bilateral, en el de la",
+        "diferencia real entre las poblaciones)."
+      ),
+      helpText(
+        "Contrastes: t para las medias de poblaciones normales y z con la",
+        "estimación conjunta del parámetro para las binomiales y las de Poisson."
+      )
+    ),
+    uiOutput("cd_valores"),
+    layout_columns(
+      col_widths = c(8, 4),
+      card(
+        full_screen = TRUE,
+        card_header("Distribución de frecuencias del estadístico de contraste"),
+        plotOutput("cd_plot", height = "450px")
+      ),
+      card(
+        full_screen = TRUE,
+        card_header("Distribución de las poblaciones"),
+        plotOutput("cd_pob_plot", height = "450px")
+      )
+    )
+  )
+)
+
 ui <- page_navbar(
   title = tags$span(
     class = "d-inline-flex align-items-center gap-2",
@@ -609,6 +720,7 @@ ui <- page_navbar(
   ui_tcl,
   ui_ic,
   ui_ct,
+  ui_cd,
   nav_spacer(),
   nav_item(input_dark_mode(id = "modo", mode = "light"))
 )
@@ -1089,6 +1201,337 @@ server <- function(input, output, session) {
     if (!input$ct_teorica) g <- g + guides(linetype = "none", linewidth = "none")
     if (cv$log) g <- g + scale_x_log10()
     g
+  })
+
+  # Comparación de dos poblaciones ---------------------------------------------
+
+  # Rango de los tamaños muestrales según la distribución. Al cambiar de
+  # distribución se ajustan los deslizadores, conservando su valor si cabe.
+  rangos_n <- list(normal = c(5, 100), binomial = c(10, 1000), poisson = c(5, 100))
+  observeEvent(input$cd_dist, {
+    r <- rangos_n[[input$cd_dist]]
+    for (id in c("cd_n1", "cd_n2")) {
+      updateSliderInput(session, id, min = r[1], max = r[2], value = min(max(input[[id]], r[1]), r[2]))
+    }
+  }, ignoreInit = TRUE)
+
+  cd_par <- reactive({
+    s <- list(n1 = input$cd_n1, n2 = input$cd_n2, alfa = input$cd_alfa, alt = input$cd_alt)
+    switch(input$cd_dist,
+      normal = {
+        req(is.finite(input$cd_mu1), is.finite(input$cd_mu2))
+        validate(need(
+          isTRUE(input$cd_sd1 > 0 && input$cd_sd2 > 0),
+          "Las desviaciones típicas deben ser positivas."
+        ))
+        c(s, list(
+          tipo = "media", mu1 = input$cd_mu1, mu2 = input$cd_mu2,
+          sd1 = input$cd_sd1, sd2 = input$cd_sd2, var = input$cd_var,
+          delta = input$cd_delta_norm
+        ))
+      },
+      binomial = {
+        # Cada observación son m ensayos de Bernoulli, así que se comparan las
+        # proporciones de éxitos en n·m ensayos.
+        s$n1 <- s$n1 * input$cd_m
+        s$n2 <- s$n2 * input$cd_m
+        c(s, list(tipo = "proporcion", p1 = input$cd_p1, p2 = input$cd_p2, delta = input$cd_delta_binom))
+      },
+      poisson = c(s, list(tipo = "poisson", l1 = input$cd_l1, l2 = input$cd_l2, delta = input$cd_delta_pois))
+    )
+  })
+
+  # Parámetros bajo H1 con la diferencia mínima δ en el sentido de la
+  # alternativa. En la bilateral se toma el sentido de la diferencia real entre
+  # las poblaciones, salvo que deje el parámetro fuera de su rango.
+  cd_h1 <- reactive({
+    s <- cd_par()
+    validate(need(isTRUE(s$delta > 0), "La diferencia mínima a detectar debe ser positiva."))
+    valido <- function(h) {
+      switch(h$tipo,
+        media = TRUE,
+        proporcion = h$p2 > 0 && h$p2 < 1,
+        poisson = h$l2 > 0
+      )
+    }
+    signo <- switch(s$alt, mayor = 1, menor = -1, bilateral = if (diferencia(s) < 0) -1 else 1)
+    h1 <- con_diferencia(s, signo * s$delta)
+    if (s$alt == "bilateral" && !valido(h1)) h1 <- con_diferencia(s, -signo * s$delta)
+    validate(need(
+      valido(h1),
+      "Con esta diferencia mínima el parámetro de la población 2 bajo H₁ queda fuera de su rango."
+    ))
+    h1
+  })
+
+  # Simulación al pulsar el botón. Se guarda con los parámetros usados y solo
+  # se muestra mientras coincidan con los actuales: al cambiar cualquier
+  # parámetro desaparece hasta que se vuelva a simular.
+  cd_sim <- reactiveVal(NULL)
+  observeEvent(input$cd_sim, {
+    req(input$cd_sim > 0)
+    s <- c(cd_par(), k = input$cd_k)
+    cd_sim(list(s = s, r = contraste(s, s$k)))
+  })
+  cd <- reactive({
+    sim <- cd_sim()
+    if (!is.null(sim) && identical(sim$s, c(cd_par(), k = input$cd_k))) sim$r
+  })
+
+  # ¿Es cierta H0 en las poblaciones simuladas? En las alternativas
+  # unilaterales H0 incluye también las diferencias en el sentido contrario.
+  cd_h0_cierta <- reactive({
+    d <- diferencia(cd_par())
+    switch(cd_par()$alt, bilateral = d == 0, mayor = d <= 0, menor = d >= 0)
+  })
+
+  # Opacidad de las barras del histograma, semitransparentes para que se vean
+  # las áreas de los riesgos α y β, y de esas áreas.
+  opacidad_barras <- 0.45
+  opacidad_areas <- 0.3
+
+  output$cd_valores <- renderUI({
+    m <- m()
+    # Los recuadros tienen el mismo color que su elemento del gráfico: el color
+    # con su opacidad sobre el fondo. El texto es el color de texto o el de
+    # fondo de la app, el que más contraste tenga.
+    sombreado <- function(color, opacidad) {
+      bg <- opacidad * col2rgb(color) + (1 - opacidad) * col2rgb(m$superficie)
+      luminancia <- function(rgb) {
+        c <- rgb / 255
+        c <- ifelse(c <= 0.03928, c / 12.92, ((c + 0.055) / 1.055)^2.4)
+        sum(c(0.2126, 0.7152, 0.0722) * c)
+      }
+      contraste <- function(fg) {
+        l <- sort(c(luminancia(bg), luminancia(col2rgb(fg))), decreasing = TRUE)
+        (l[1] + 0.05) / (l[2] + 0.05)
+      }
+      fg <- c(m$texto, m$superficie)
+      value_box_theme(
+        bg = rgb(t(bg), maxColorValue = 255),
+        fg = fg[which.max(vapply(fg, contraste, numeric(1)))]
+      )
+    }
+    fila_valores(
+      value_box(
+        "Aceptaciones de H₀", textOutput("cd_acepta"),
+        p(textOutput("cd_acepta_nota", inline = TRUE)),
+        theme = sombreado(m$series[3], opacidad_barras)
+      ),
+      value_box(
+        "Rechazos de H₀", textOutput("cd_rechaza"),
+        p(textOutput("cd_rechaza_nota", inline = TRUE)),
+        theme = sombreado(m$series[8], opacidad_barras)
+      ),
+      value_box(
+        "Riesgo α", textOutput("cd_alfa"),
+        p(textOutput("cd_alfa_nota", inline = TRUE)),
+        theme = sombreado(m$series[1], opacidad_areas)
+      ),
+      value_box(
+        "Riesgo β (con la diferencia mínima)", textOutput("cd_beta"),
+        p(textOutput("cd_potencia", inline = TRUE)),
+        theme = sombreado(m$series[2], opacidad_areas)
+      )
+    )
+  })
+
+  # Número y porcentaje de rechazos (o de aceptaciones) de la simulación.
+  frecuencia <- function(rechazos) {
+    r <- cd()
+    if (is.null(r)) return("—")
+    x <- r$rechaza == rechazos
+    sprintf("%d (%s)", sum(x), pct(mean(x)))
+  }
+  output$cd_acepta <- renderText(frecuencia(FALSE))
+  output$cd_rechaza <- renderText(frecuencia(TRUE))
+  output$cd_acepta_nota <- renderText(
+    if (is.null(cd())) {
+      "Pulsa «Simular»"
+    } else if (cd_h0_cierta()) {
+      "Decisiones correctas (H₀ cierta)"
+    } else {
+      "Errores de tipo II (H₀ falsa)"
+    }
+  )
+  output$cd_rechaza_nota <- renderText(
+    if (is.null(cd())) {
+      "Pulsa «Simular»"
+    } else if (cd_h0_cierta()) {
+      "Errores de tipo I (H₀ cierta)"
+    } else {
+      "Decisiones correctas (H₀ falsa)"
+    }
+  )
+  output$cd_alfa <- renderText(pct(prob_rechazo(bajo_h0(cd_par()))))
+  output$cd_alfa_nota <- renderText(paste("Nivel de significación:", pct(cd_par()$alfa, 0)))
+  output$cd_beta <- renderText(pct(1 - prob_rechazo(cd_h1())))
+  output$cd_potencia <- renderText(paste("Potencia (1 − β):", pct(prob_rechazo(cd_h1()))))
+
+  # Distribuciones teóricas del estadístico bajo H0 y bajo H1.
+  cd_teoricas <- reactive({
+    s <- cd_par()
+    list(distribucion(bajo_h0(s)), distribucion(cd_h1()))
+  })
+
+  # Rango del eje X del estadístico: el de las distribuciones teóricas, los
+  # valores críticos y, si se ha simulado, los valores simulados. Se recortan
+  # las colas extremas; las frecuencias se calculan sobre el total de
+  # simulaciones.
+  cd_lim <- reactive({
+    lim <- range(sapply(cd_teoricas(), function(f) f$q(c(0.002, 0.998))), criticos(cd_par()))
+    if (!is.null(cd())) lim <- range(lim, quantile(cd()$t, c(0.002, 0.998)))
+    lim
+  })
+
+  # Al fijar la escala se guarda el rango del momento; al soltarla se vuelve
+  # al rango automático.
+  cd_lim_fijo <- reactiveVal(NULL)
+  observeEvent(input$cd_eje_fijo, {
+    cd_lim_fijo(if (input$cd_eje_fijo) tryCatch(cd_lim(), error = function(e) NULL))
+  })
+
+  output$cd_plot <- renderPlot({
+    s <- cd_par()
+    h1 <- cd_h1()
+    teoricas <- cd_teoricas()
+    r <- cd()
+    m <- m()
+    simbolo <- c(media = "μ", proporcion = "p", poisson = "λ")[[s$tipo]]
+    crit <- criticos(s)
+    lim <- cd_lim_fijo()
+    if (is.null(lim)) lim <- cd_lim()
+    g <- ggplot()
+    if (!is.null(r)) {
+      k <- length(r$t)
+      decisiones <- c("Aceptación de H₀", "Rechazo de H₀")
+      d <- data.frame(
+        t = r$t,
+        decision = factor(ifelse(r$rechaza, decisiones[2], decisiones[1]), levels = decisiones)
+      )
+      d <- d[d$t >= lim[1] & d$t <= lim[2], ]
+      # Ancho de clase con un número entero de clases entre los dos valores
+      # críticos, para que ninguna clase quede a ambos lados de uno de ellos.
+      ancho <- diff(lim) / 60
+      if (length(crit) == 2) ancho <- diff(crit) / max(1, round(diff(crit) / ancho))
+      g <- g +
+        geom_histogram(
+          data = d, aes(t, y = after_stat(count / (k * width)), fill = decision),
+          binwidth = ancho, boundary = crit[1], colour = m$superficie, linewidth = 0.2,
+          alpha = opacidad_barras,
+          # Muestra en la leyenda también la decisión que no se haya dado nunca.
+          show.legend = c(fill = TRUE, colour = FALSE)
+        ) +
+        scale_fill_manual(values = setNames(m$series[c(3, 8)], decisiones), name = NULL, drop = FALSE)
+    }
+    x <- seq(lim[1], lim[2], length.out = 500)
+    curvas <- c(
+      sprintf("Teórica bajo H₀ (%s₁ = %s₂), área sombreada: α", simbolo, simbolo),
+      sprintf("Teórica bajo H₁ (%s₁ − %s₂ = %s), área sombreada: β", simbolo, simbolo, fmt(diferencia(h1), 2))
+    )
+    dc <- data.frame(
+      t = c(x, x), densidad = c(teoricas[[1]]$d(x), teoricas[[2]]$d(x)),
+      curva = factor(rep(curvas, each = length(x)), levels = curvas)
+    )
+    # Riesgo α: área bajo la densidad de H0 en la región de rechazo. Riesgo β:
+    # área bajo la densidad de H1 en la región de aceptación. Cada intervalo
+    # se recorta a los límites del gráfico.
+    rechazo <- switch(s$alt,
+      bilateral = list(c(-Inf, crit[1]), c(crit[2], Inf)),
+      mayor = list(c(crit, Inf)),
+      menor = list(c(-Inf, crit))
+    )
+    aceptacion <- switch(s$alt,
+      bilateral = list(crit),
+      mayor = list(c(-Inf, crit)),
+      menor = list(c(crit, Inf))
+    )
+    areas <- function(f, intervalos, nombre) {
+      do.call(rbind, lapply(seq_along(intervalos), function(i) {
+        a <- max(intervalos[[i]][1], lim[1])
+        b <- min(intervalos[[i]][2], lim[2])
+        if (a >= b) return(NULL)
+        x <- seq(a, b, length.out = 200)
+        data.frame(t = x, densidad = f(x), trozo = paste(nombre, i))
+      }))
+    }
+    da <- areas(teoricas[[1]]$d, rechazo, "alfa")
+    db <- areas(teoricas[[2]]$d, aceptacion, "beta")
+    if (!is.null(da)) {
+      g <- g + geom_ribbon(
+        data = da, aes(t, ymin = 0, ymax = densidad, group = trozo),
+        fill = m$series[1], alpha = opacidad_areas
+      )
+    }
+    if (!is.null(db)) {
+      g <- g + geom_ribbon(
+        data = db, aes(t, ymin = 0, ymax = densidad, group = trozo),
+        fill = m$series[2], alpha = opacidad_areas
+      )
+    }
+    g +
+      geom_line(data = dc, aes(t, densidad, colour = curva), linewidth = 1) +
+      geom_vline(xintercept = crit, linetype = "dashed", colour = m$secundario, linewidth = 0.6) +
+      scale_colour_manual(values = setNames(m$series[1:2], curvas), name = NULL) +
+      guides(fill = guide_legend(order = 1), colour = guide_legend(ncol = 1, order = 2)) +
+      # El eje Y se ajusta a las curvas teóricas: con pocas simulaciones las
+      # barras del histograma son muy altas y las aplastarían, así que se
+      # cortan por arriba.
+      coord_cartesian(xlim = lim, ylim = c(0, 1.5 * max(dc$densidad))) +
+      labs(
+        x = "Estadístico de contraste", y = "Densidad",
+        subtitle = sprintf(
+          "Poblaciones: %s₁ − %s₂ = %s. Línea discontinua: valores críticos.%s",
+          simbolo, simbolo, fmt(diferencia(s), 2),
+          if (is.null(r)) "\nPulsa «Simular» para ver la distribución de frecuencias simulada." else ""
+        )
+      ) +
+      tema(m) +
+      theme(legend.box = "vertical", legend.spacing.y = unit(0, "pt"))
+  })
+
+  output$cd_pob_plot <- renderPlot({
+    m <- m()
+    if (input$cd_dist == "normal") {
+      s <- cd_par()
+      mu <- c(s$mu1, s$mu2)
+      sd <- c(s$sd1, s$sd2)
+      nombres <- sprintf("Población %d: N(%s, %s)", 1:2, mu, sd)
+      x <- seq(min(mu - 4 * sd), max(mu + 4 * sd), length.out = 500)
+      d <- data.frame(
+        x = c(x, x), y = c(dnorm(x, mu[1], sd[1]), dnorm(x, mu[2], sd[2])),
+        pob = factor(rep(nombres, each = length(x)), levels = nombres)
+      )
+      g <- ggplot(d, aes(x, y, colour = pob, fill = pob)) +
+        geom_area(position = "identity", alpha = 0.25) +
+        geom_line(linewidth = 1) +
+        labs(y = "Densidad")
+    } else {
+      if (input$cd_dist == "binomial") {
+        ensayos <- input$cd_m
+        p <- c(input$cd_p1, input$cd_p2)
+        x <- 0:ensayos
+        probs <- c(dbinom(x, ensayos, p[1]), dbinom(x, ensayos, p[2]))
+        nombres <- sprintf("Población %d: B(%d, %s)", 1:2, ensayos, p)
+      } else {
+        l <- c(input$cd_l1, input$cd_l2)
+        x <- 0:max(qpois(0.9995, l))
+        probs <- c(dpois(x, l[1]), dpois(x, l[2]))
+        nombres <- sprintf("Población %d: P(%s)", 1:2, l)
+      }
+      d <- data.frame(
+        x = c(x, x), y = probs,
+        pob = factor(rep(nombres, each = length(x)), levels = nombres)
+      )
+      g <- ggplot(d, aes(x, y, fill = pob)) +
+        geom_col(position = position_dodge(width = 0.85), width = 0.8) +
+        labs(y = "P(X = x)")
+    }
+    g +
+      scale_fill_manual(values = setNames(m$series[c(7, 4)], nombres), name = NULL, aesthetics = c("colour", "fill")) +
+      guides(fill = guide_legend(ncol = 1), colour = guide_legend(ncol = 1)) +
+      labs(x = "x") +
+      tema(m)
   })
 }
 
