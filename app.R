@@ -66,8 +66,21 @@ poblacion <- function(input) {
         nombre = sprintf("U(%s, %s)", a, b), discreta = FALSE,
         r = function(k) runif(k, a, b),
         d = function(x) dunif(x, a, b),
-        rango = c(a - 0.1 * (b - a), b + 0.1 * (b - a)),
+        rango = c(a - 0.1 * (b - a), b + 0.1 * (b - a)), soporte = c(a, b),
         media = (a + b) / 2, sd = (b - a) / sqrt(12)
+      )
+    },
+    uniforme_discreta = {
+      # Enteros de a a b, con al menos dos valores.
+      a <- round(input$ud_a)
+      b <- max(round(input$ud_b), a + 1)
+      k <- b - a + 1
+      list(
+        nombre = sprintf("U{%d, …, %d}", a, b), discreta = TRUE,
+        r = function(m) a + floor(runif(m) * k),
+        d = function(x) ifelse(x >= a & x <= b & x == round(x), 1 / k, 0),
+        rango = c(a, b),
+        media = (a + b) / 2, sd = sqrt((k^2 - 1) / 12)
       )
     },
     binomial = {
@@ -108,7 +121,7 @@ poblacion <- function(input) {
         nombre = sprintf("Exp(%s)", l), discreta = FALSE,
         r = function(k) rexp(k, l),
         d = function(x) dexp(x, l),
-        rango = c(0, qexp(0.999, l)),
+        rango = c(0, qexp(0.999, l)), soporte = c(0, Inf),
         media = 1 / l, sd = 1 / l
       )
     },
@@ -118,7 +131,7 @@ poblacion <- function(input) {
         nombre = sprintf("χ²(%d)", g), discreta = FALSE,
         r = function(k) rchisq(k, g),
         d = function(x) dchisq(x, g),
-        rango = c(0, qchisq(0.999, g)),
+        rango = c(0, qchisq(0.999, g)), soporte = c(0, Inf),
         media = g, sd = sqrt(2 * g)
       )
     }
@@ -879,8 +892,10 @@ ui_tcl <- nav_panel(
       width = 300,
       title = "Parámetros",
       selectInput("tcl_dist", "Distribución de la población",
+        selected = "uniforme_discreta",
         choices = c(
-          "Uniforme" = "uniforme", "Binomial" = "binomial", "Poisson" = "poisson",
+          "Uniforme continua" = "uniforme", "Uniforme discreta" = "uniforme_discreta",
+          "Binomial" = "binomial", "Poisson" = "poisson",
           "Normal" = "normal", "Exponencial" = "exponencial", "Chi-cuadrado" = "chicuadrado"
         )
       ),
@@ -888,6 +903,11 @@ ui_tcl <- nav_panel(
         "input.tcl_dist == 'uniforme'",
         numericInput("unif_a", "Mínimo (a)", value = 0),
         numericInput("unif_b", "Máximo (b)", value = 1)
+      ),
+      conditionalPanel(
+        "input.tcl_dist == 'uniforme_discreta'",
+        numericInput("ud_a", "Mínimo (a, entero)", value = 1, step = 1),
+        numericInput("ud_b", "Máximo (b, entero)", value = 6, step = 1)
       ),
       conditionalPanel(
         "input.tcl_dist == 'binomial'",
@@ -912,13 +932,25 @@ ui_tcl <- nav_panel(
         sliderInput("chi_gl", "Grados de libertad", min = 1, max = 30, value = 2, step = 1)
       ),
       sliderInput("tcl_n", "Tamaño muestral (n)", min = 1, max = 200, value = 30, step = 1),
-      sliderInput("tcl_m", "Número de muestras", min = 100, max = 10000, value = 2000, step = 100),
+      sliderInput("tcl_m", "Número de muestras en cada simulación", min = 1, max = 100, value = 10, step = 1),
       checkboxInput("tcl_normal", "Superponer la normal N(μ, σ/√n)", value = TRUE),
-      boton_simular("tcl_sim")
+      div(
+        class = "d-flex flex-wrap gap-2",
+        boton_simular("tcl_sim", "Añadir muestras"),
+        actionButton("tcl_reiniciar", "Reiniciar", icon = icon("rotate-left"), class = "btn-outline-secondary")
+      ),
+      helpText(
+        "Cada pulsación de «Añadir muestras» acumula en el histograma las medias",
+        "de las nuevas muestras hasta que se pulse «Reiniciar». También se",
+        "reinicia al cambiar la población o el tamaño muestral."
+      )
     ),
     fila_valores(
       value_box("Media teórica de X̄ (μ)", textOutput("tcl_mu"), theme = "primary"),
-      value_box("Media de las medias simuladas", textOutput("tcl_media")),
+      value_box(
+        "Media de las medias simuladas", textOutput("tcl_media"),
+        p(textOutput("tcl_k", inline = TRUE))
+      ),
       value_box("Desv. típica teórica de X̄ (σ/√n)", textOutput("tcl_sd"), theme = "primary"),
       value_box("Desv. típica de las medias simuladas", textOutput("tcl_sdsim"))
     ),
@@ -1288,50 +1320,104 @@ server <- function(input, output, session) {
 
   pob <- reactive(poblacion(input))
 
-  tcl <- reactive({
-    input$tcl_sim
-    p <- pob()
+  # Medias acumuladas: las de la última simulación y las de las anteriores.
+  # Se vacían al pulsar «Reiniciar» y al cambiar la población o el tamaño
+  # muestral, porque las medias anteriores serían de otra distribución.
+  sin_medias <- list(previas = numeric(), ultimas = numeric())
+  tcl_medias <- reactiveVal(sin_medias)
+  observeEvent(list(pob(), input$tcl_n), tcl_medias(sin_medias))
+  observeEvent(input$tcl_reiniciar, tcl_medias(sin_medias))
+  observeEvent(input$tcl_sim, {
+    req(input$tcl_sim > 0)
     n <- input$tcl_n
     m <- input$tcl_m
-    medias <- rowMeans(matrix(p$r(n * m), nrow = m, ncol = n))
-    list(medias = medias, n = n, mu = p$media, sd = p$sd / sqrt(n), discreta = p$discreta)
+    nuevas <- rowMeans(matrix(pob()$r(n * m), nrow = m, ncol = n))
+    a <- tcl_medias()
+    tcl_medias(list(previas = c(a$previas, a$ultimas), ultimas = nuevas))
+  })
+
+  tcl <- reactive({
+    p <- pob()
+    a <- tcl_medias()
+    n <- input$tcl_n
+    list(
+      medias = c(a$previas, a$ultimas), previas = a$previas, ultimas = a$ultimas,
+      n = n, mu = p$media, sd = p$sd / sqrt(n), discreta = p$discreta, soporte = p$soporte
+    )
   })
 
   output$tcl_mu <- renderText(fmt(tcl()$mu))
-  output$tcl_media <- renderText(fmt(mean(tcl()$medias)))
+  output$tcl_media <- renderText(if (length(tcl()$medias) > 0) fmt(mean(tcl()$medias)) else "—")
+  output$tcl_k <- renderText({
+    k <- length(tcl()$medias)
+    if (k == 1) "1 media acumulada" else sprintf("%d medias acumuladas", k)
+  })
   output$tcl_sd <- renderText(fmt(tcl()$sd))
-  output$tcl_sdsim <- renderText(fmt(sd(tcl()$medias)))
+  output$tcl_sdsim <- renderText(if (length(tcl()$medias) > 1) fmt(sd(tcl()$medias)) else "—")
 
   output$tcl_plot <- renderPlot({
     s <- tcl()
     m <- m()
-    d <- data.frame(media = s$medias)
-    # Ancho de clase de Freedman-Diaconis; en poblaciones discretas la media
-    # sólo toma valores múltiplos de 1/n, así que se ajusta a ese retículo.
-    ancho <- 2 * IQR(s$medias) / length(s$medias)^(1 / 3)
-    if (!is.finite(ancho) || ancho <= 0) ancho <- max(s$sd / 10, 1e-6)
+    k <- length(s$medias)
+    # Ancho de clase y eje X fijos (a partir de la distribución teórica de X̄)
+    # para que el histograma no cambie de escala al acumular medias. En
+    # poblaciones discretas la media solo toma valores múltiplos de 1/n, así
+    # que el ancho se ajusta a ese retículo y las clases se centran en él. En
+    # poblaciones continuas con valores acotados la primera clase empieza en el
+    # mínimo y, si también hay máximo, el ancho se ajusta para que la última
+    # acabe en él.
+    ancho <- s$sd / 3
     if (s$discreta) {
       paso <- 1 / s$n
       ancho <- max(1, round(ancho / paso)) * paso
       limite <- paso / 2
+    } else if (!is.null(s$soporte)) {
+      limite <- s$soporte[1]
+      if (is.finite(s$soporte[2])) {
+        amplitud <- diff(s$soporte)
+        ancho <- amplitud / max(1, round(amplitud / ancho))
+      }
     } else {
-      limite <- 0
+      limite <- s$mu
     }
-    g <- ggplot(d, aes(media)) +
-      geom_histogram(aes(y = after_stat(density)),
-        binwidth = ancho, boundary = limite,
-        fill = m$series[1], colour = m$superficie, linewidth = 0.3
-      ) +
-      geom_vline(xintercept = s$mu, linetype = "dashed", colour = m$secundario, linewidth = 0.6) +
-      labs(x = "Media muestral (x̄)", y = "Densidad") +
-      tema(m)
+    lim <- range(s$mu + c(-4, 4) * s$sd, s$medias)
+    g <- ggplot()
+    if (k > 0) {
+      grupos <- c("Medias anteriores", "Medias de la última simulación")
+      d <- data.frame(
+        media = c(s$previas, s$ultimas),
+        grupo = factor(rep(grupos, c(length(s$previas), length(s$ultimas))), levels = grupos)
+      )
+      # Histograma de densidad: las alturas se dividen entre el total de medias
+      # (no entre las de cada grupo), así que el área total es 1.
+      g <- g +
+        geom_histogram(
+          data = d, aes(media, y = after_stat(count / (k * width)), fill = grupo),
+          binwidth = ancho, boundary = limite, colour = m$superficie, linewidth = 0.3,
+          show.legend = c(fill = TRUE, colour = FALSE)
+        ) +
+        scale_fill_manual(values = setNames(m$series[c(1, 4)], grupos), name = NULL, drop = FALSE)
+    }
+    # Con pocas medias las barras son muy altas (cada media aporta 1/(k·ancho))
+    # y aplastarían la normal, así que el eje Y se ajusta a ella y las barras se
+    # cortan por arriba.
+    ylim <- NULL
     if (input$tcl_normal) {
       g <- g + stat_function(
         fun = dnorm, args = list(mean = s$mu, sd = s$sd),
-        colour = m$series[2], linewidth = 1, n = 500
+        colour = m$series[2], linewidth = 1, n = 500, xlim = lim
       )
+      ylim <- c(0, 1.5 * dnorm(0, sd = s$sd))
     }
-    g
+    g +
+      geom_vline(xintercept = s$mu, linetype = "dashed", colour = m$secundario, linewidth = 0.6) +
+      coord_cartesian(xlim = lim, ylim = ylim) +
+      labs(
+        x = "Media muestral (x̄)", y = "Densidad",
+        subtitle = if (k == 0) "Pulsa «Añadir muestras» para empezar a acumular medias." else
+          sprintf("%d %s acumuladas. Línea discontinua: μ.", k, if (k == 1) "media" else "medias")
+      ) +
+      tema(m)
   })
 
   output$tcl_pob_titulo <- renderText(paste("Población:", pob()$nombre))
